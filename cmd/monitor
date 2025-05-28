@@ -1,0 +1,120 @@
+#!/bin/sh
+SRC=$(realpath "$0")
+DIR=$(dirname "$SRC")
+#V="-v"
+
+usage() {
+   echo 1>&2 usage: $(basename "$SRC") DOCID FILE [[-u] SOCKET] [REDIS]
+   exit 1
+}
+
+if [ $# -lt 2 -o $# -gt 5 ]; then
+    usage
+fi
+
+DOCID="$1"
+FILE="$(realpath "$2")"
+SOCK="$3"
+REDIS="$4"
+SOCKARG="-h $SOCK"
+if [ "$SOCK" = -u ]; then
+    SOCK="$4"
+    SOCKARG="-u $SOCK"
+    REDIS="$5"
+    rm -f "$SOCK"
+fi
+if [ "$REDIS" = "" ]; then
+    REDIS=localhost:6379
+fi
+if [ "$SOCK" = "" ]; then
+    SOCKARG=""
+fi
+TMPDIR=$(mktemp -d)
+SCRATCH="$TMPDIR/scratch"
+SCRATCHTEST="$TMPDIR/scratchtest"
+SCRATCH2="$TMPDIR/scratch2"
+FILETEST="$TMPDIR/filetest"
+SERIAL=0
+
+touch "$FILETEST"
+touch "$SCRATCH"
+touch "$SCRATCHTEST"
+
+filemod() {
+    stat -c %Y "$FILE"
+}
+
+waitforfilechange() {
+    if [ "$2" -nt "$1" ]; then
+        evt=$(inotifywait -qq -e close_write -e moved_from -e move -e move_self -e delete_self "$1")
+        touch "$2"
+    fi
+}
+
+readfile() {
+    yq -o=json -I=0 < "$FILE" | jq -c '[to_entries[]|{"name":.key}+.value]'
+}
+
+runcmd() {
+    #echo 1>&2 RUN "$DIR/cmd" $V "$@"
+    if ! "$DIR/cmd" $V "$@"; then
+        exit 1
+    fi
+}
+
+monitorfile() {
+    while true; do
+        waitforfilechange "$FILE" "$FILETEST"
+        readfile | runcmd patch $SOCKARG "$DOCID" > /dev/null
+        #touch "$FILETEST"
+    done
+}
+
+# convert all this to code in monitor.go
+monitor() {
+    while true; do
+        if NEWSER=$("$DIR/cmd" updates --no-data -t 5 $SOCKARG "$DOCID" "$SERIAL"); then
+            if [ "$NEWSER" != "$SERIAL" ]; then
+                runcmd get $SOCKARG "$DOCID" | yq -P 'sort_keys(...)' > "$SCRATCH"
+                mv "$SCRATCH" "$FILE"
+                SERIAL="$NEWSER"
+                touch "$FILETEST"
+            fi
+        else
+            break
+        fi
+    done
+}
+
+(cd "$DIR"; go build) || {
+    echo 1>&2 Go build failed
+    exit 1
+}
+
+MONITORFILEPID="" 
+MONITORPID=""
+"$DIR/cmd" serve $SOCKARG $REDIS&
+SERVERPID=$!
+sleep 2
+
+if [ -e "$FILE.bak" ]; then
+    cp "$FILE.bak" "$FILE"
+fi
+readfile | runcmd add $SOCKARG "$DOCID" > /dev/null
+monitor&
+MONITORPID="$!"
+monitorfile&
+MONITORFILEPID="$!"
+
+die() {
+    kill "$SERVERPID"
+    kill "$MONITORPID"
+    kill "$MONITORFILEPID"
+    rm -rf "$TMPDIR"
+    exit 1
+}
+
+trap "echo EXITING; die" EXIT
+trap exit INT TERM
+
+wait
