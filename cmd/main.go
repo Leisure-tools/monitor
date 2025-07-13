@@ -5,6 +5,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,6 +17,7 @@ import (
 	"os/signal"
 	"os/user"
 	"path"
+	"runtime/debug"
 	"strings"
 
 	"github.com/alecthomas/kong"
@@ -49,6 +51,9 @@ type CLI struct {
 	Get           GetCmd     `cmd help:"Get a document or a block within it"`
 	Patch         PatchCmd   `cmd help:"Add or replace blocks in a document"`
 	Updates       UpdatesCmd `cmd help:"Fetch any updates since the given serial"`
+	Track         TrackCmd   `cmd help:"Track a document or show the current tracking file"`
+	Clear         ClearCmd   `cmd help:"Clear streams of pending data"`
+	Dump          DumpCmd    `cmd help:"Print all pending stream data"`
 }
 
 type ClientGlobals struct {
@@ -64,7 +69,11 @@ type URLOpts struct {
 type ServeCmd struct {
 	UnixSocket string `short:u help:"Unix domain socket name, defaults to ~/.monitor.socket, use \"\" to avoid listing"`
 	Tcp        string `short:t optional help:"[host:]port to listen on, defaults to localhost:8080"`
-	Redis      string `arg help:"REDIS connect string"`
+	Redis      string `arg optional help:"REDIS connect string, instead of providing conf, [user, host, db]"`
+	RedisUser  string `optional help:"REDIS user -- used with --redis-conf"`
+	RedisHost  string `optional help:"REDIS host -- used with --redis-conf"`
+	RedisConf  string `optional help:"REDIS CONF FILE -- used with --redis-host"`
+	RedisDb    int    `optional help:"REDIS DB -- used with --redis-host"`
 }
 
 type ListCmd struct {
@@ -73,7 +82,8 @@ type ListCmd struct {
 
 type AddCmd struct {
 	*ClientGlobals
-	Doc string `arg help:"doument name"`
+	Doc  string `arg help:"doument name"`
+	File string `arg help:"Use FILE for document and track it, - means stdin and does not track anything"`
 }
 
 type RemoveCmd struct {
@@ -89,7 +99,8 @@ type GetCmd struct {
 
 type PatchCmd struct {
 	*ClientGlobals
-	Doc string `arg help:"doument name"`
+	Doc  string `arg help:"doument name"`
+	File string `arg help:"File to read, use - for stdin"`
 }
 
 type UpdatesCmd struct {
@@ -98,6 +109,20 @@ type UpdatesCmd struct {
 	Doc     string  `arg help:"doument name"`
 	Serial  string  `arg help:"serial to start at" `
 	Timeout float64 `optional short:t help:"Timeout in seconds"`
+}
+
+type TrackCmd struct {
+	*ClientGlobals
+	Doc  string  `arg help:"doument name"`
+	File *string `arg optional help:"File to track, if omitted, print the currently tracked file, empty string means stop tracking" type:path`
+}
+
+type ClearCmd struct {
+	*ClientGlobals
+}
+
+type DumpCmd struct {
+	*ClientGlobals
 }
 
 type myMux struct {
@@ -127,10 +152,36 @@ func abort(format string, args ...any) {
 	die()
 }
 
+func readConf(cli *CLI) (string, *tls.Config, error) {
+	opts := cli.Serve
+	if opts.RedisConf == "" {
+		params := monitor.CheckSet("user", opts.RedisUser, "host", opts.RedisHost, "db", opts.RedisDb)
+		if len(params) > 0 {
+			return "", nil, fmt.Errorf("No REDIS conf file but these options require it: %s", strings.Join(params, ", "))
+		}
+		return "", nil, nil
+	}
+	return (&monitor.RedisConf{
+		User: opts.RedisUser,
+		Host: opts.RedisHost,
+		Db:   opts.RedisDb,
+		Conf: opts.RedisConf,
+	}).Read()
+}
+
 func (cmd *ServeCmd) Run(cli *CLI) error {
+	println("RUNNING SERVE COMMAND ")
 	mux := http.NewServeMux()
+	var conStr string
 	var err error
-	if cli.mon, err = monitor.New(cmd.Redis, cli.Verbose); err != nil {
+	var tlsConf *tls.Config
+	if conStr, tlsConf, err = readConf(cli); err != nil {
+		panic(err)
+	} else if conStr == "" {
+		conStr = cmd.Redis
+	}
+	println("SERVE ", conStr)
+	if cli.mon, err = monitor.New(conStr, cli.Verbose, tlsConf); err != nil {
 		abort("Could not connect to REDIS")
 	}
 	cli.mon.Verbose = cli.Verbose
@@ -241,7 +292,12 @@ func (cmd *ListCmd) Run(cli *CLI) error {
 }
 
 func (cmd *AddCmd) Run(cli *CLI) error {
-	resp := cli.post(monitor.URL_PREFIX+cmd.Doc, os.Stdin)
+	var resp *http.Response
+	if cmd.File == "-" {
+		resp = cli.post(monitor.URL_PREFIX+cmd.Doc, os.Stdin)
+	} else {
+		resp = cli.get(fmt.Sprintf("%s%s/add/%s", monitor.URL_PREFIX, cmd.Doc, url.PathEscape(cmd.File)))
+	}
 	checkError(resp)
 	outputResponse(resp)
 	return nil
@@ -254,7 +310,7 @@ func (cmd *RemoveCmd) Run(cli *CLI) error {
 func (cmd *GetCmd) Run(cli *CLI) error {
 	url := monitor.URL_PREFIX + cmd.Doc
 	if cmd.Block != "" {
-		url += "/" + cmd.Block
+		url += "/get/" + cmd.Block
 	}
 	resp := cli.get(url)
 	checkError(resp)
@@ -263,7 +319,15 @@ func (cmd *GetCmd) Run(cli *CLI) error {
 }
 
 func (cmd *PatchCmd) Run(cli *CLI) error {
-	resp := cli.patch(monitor.URL_PREFIX+cmd.Doc, os.Stdin)
+	var resp *http.Response
+	if cmd.File == "-" {
+		resp = cli.patch(monitor.URL_PREFIX+cmd.Doc, os.Stdin)
+	} else if file, err := os.Open(cmd.File); err != nil {
+		fmt.Fprintln(os.Stderr, "Error opening file: ", err)
+		return nil
+	} else {
+		resp = cli.patch(monitor.URL_PREFIX+cmd.Doc, file)
+	}
 	checkError(resp)
 	outputResponse(resp)
 	return nil
@@ -282,6 +346,37 @@ func (cmd *UpdatesCmd) Run(cli *CLI) error {
 		url = addQuery(url, "timeout", cmd.Timeout)
 	}
 	resp := cli.get(url)
+	checkError(resp)
+	outputResponse(resp)
+	return nil
+}
+
+func (cmd *TrackCmd) Run(cli *CLI) error {
+	uri := monitor.URL_PREFIX + cmd.Doc + "/"
+	if cmd.File == nil {
+		uri += "track"
+	} else {
+		if *cli.Track.File != "" {
+			uri += "track/" + url.PathEscape(*cli.Track.File)
+		} else {
+			uri += "notrack"
+		}
+	}
+	resp := cli.get(uri)
+	checkError(resp)
+	outputResponse(resp)
+	return nil
+}
+
+func (cmd *ClearCmd) Run(cli *CLI) error {
+	resp := cli.get(monitor.URL_PREFIX + "clear")
+	checkError(resp)
+	outputResponse(resp)
+	return nil
+}
+
+func (cmd *DumpCmd) Run(cli *CLI) error {
+	resp := cli.get(monitor.URL_PREFIX + "dump")
 	checkError(resp)
 	outputResponse(resp)
 	return nil
@@ -438,19 +533,33 @@ func parseJson(resp *http.Response) any {
 }
 
 func main() {
+	defer func() {
+		if err := recover(); err != nil {
+			fmt.Fprintln(os.Stderr, "Error: ", err)
+			debug.PrintStack()
+			os.Exit(1)
+		}
+	}()
+
 	c := make(chan os.Signal, 1)
 	signal.Notify(c, os.Interrupt)
 	go func() {
 		<-c
 		die(1)
 	}()
+
 	cli := CLI{}
-	cli.List.ClientGlobals = &cli.clientGlobals
-	cli.Add.ClientGlobals = &cli.clientGlobals
-	cli.Remove.ClientGlobals = &cli.clientGlobals
-	cli.Get.ClientGlobals = &cli.clientGlobals
-	cli.Patch.ClientGlobals = &cli.clientGlobals
-	cli.Updates.ClientGlobals = &cli.clientGlobals
+	globals := &cli.clientGlobals
+	cli.List.ClientGlobals = globals
+	cli.Add.ClientGlobals = globals
+	cli.Remove.ClientGlobals = globals
+	cli.Get.ClientGlobals = globals
+	cli.Patch.ClientGlobals = globals
+	cli.Updates.ClientGlobals = globals
+	cli.Track.ClientGlobals = globals
+	cli.Clear.ClientGlobals = globals
+	cli.Dump.ClientGlobals = globals
+
 	cmdctx = kong.Parse(&cli)
 	cli.verbose("RUNNING %s %s\n", path.Base(os.Args[0]), strings.Join(os.Args[1:], " "))
 	cli.ctx = cmdctx

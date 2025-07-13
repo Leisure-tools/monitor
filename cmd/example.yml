@@ -1,4 +1,5 @@
-person1:
+# see monitor.yml for instructions
+- name: person1
   type: monitor
   root: Main.current_person
   value:

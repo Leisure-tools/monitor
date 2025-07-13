@@ -11,66 +11,68 @@ var svcCount int64 = 0
 type ChanSvc struct {
 	Activity   string
 	Owner      ServiceOwner
-	Svc        chan func()
+	Channel    chan func()
 	invocation uint64
 }
 
 type ServiceOwner interface {
-	ShutdownService(svc *ChanSvc)
+	ShutdownService(c *ChanSvc)
+}
+
+type SvcRunner interface {
+	Svc(code func(), wrap ...bool)
 }
 
 func (s *ChanSvc) String() string {
 	return fmt.Sprint("Service: ", s.Owner)
 }
 
-func WrappedSvcSync[T any](s *ChanSvc, code func() (T, error)) (T, error) {
-	return SvcSync(s, true, code)
+func CriticalSvcSync[T any](r SvcRunner, code func() (T, error)) (T, error) {
+	return SvcSync(r, code, true, true)
 }
 
-func UnwrappedSvcSync[T any](s *ChanSvc, code func() (T, error)) (T, error) {
-	return SvcSync(s, false, code)
+func WrappedSvcSync[T any](r SvcRunner, code func() (T, error)) (T, error) {
+	return SvcSync(r, code, true)
 }
 
-func SvcSync[T any](s *ChanSvc, wrap bool, code func() (T, error)) (T, error) {
+func UnwrappedSvcSync[T any](r SvcRunner, code func() (T, error)) (T, error) {
+	return SvcSync(r, code)
+}
+
+func SvcSync[T any](r SvcRunner, code func() (T, error), wrap ...bool) (T, error) {
 	result := make(chan bool)
 	var value T
 	var err error
 
-	Svc(s, false, func() {
-		if wrap {
-			defer func() {
-				if e := frecovery(s.Activity); e != nil {
-					err = e
-					s.Owner.ShutdownService(s)
-				}
-			}()
-		}
+	r.Svc(func() {
 		value, err = code()
 		result <- true
-	})
+	}, wrap...)
 	<-result
 	return value, err
 }
 
-func Svc(s *ChanSvc, wrap bool, code func()) {
+func (s *ChanSvc) Svc(code func(), wrap ...bool) {
 	go func() { // using a goroutine so the channel won't block
-		if wrap {
+		if len(wrap) > 0 && wrap[0] {
 			defer func() {
 				if e := frecovery(s.Activity); e != nil {
-					s.Shutdown()
+					if len(wrap) > 1 && wrap[1] {
+						s.Shutdown()
+					}
 				}
 			}()
 		}
 		if verboseSvc {
 			count := atomic.AddInt64(&svcCount, 1)
 			fmt.Printf("@@ QUEUE SVC %d\n", count)
-			s.Svc <- func() {
+			s.Channel <- func() {
 				fmt.Printf("@@ START SVC %d [%d]\n", count, atomic.LoadInt64(&svcCount))
 				code()
 				fmt.Printf("@@ END SVC %d [%d]\n", count, atomic.LoadInt64(&svcCount))
 			}
 		} else {
-			s.Svc <- code
+			s.Channel <- code
 		}
 	}()
 }
@@ -78,12 +80,12 @@ func Svc(s *ChanSvc, wrap bool, code func()) {
 // Run a service. Close the channel to stop it.
 func NewSvc(owner ServiceOwner) *ChanSvc {
 	s := &ChanSvc{
-		Owner: owner,
-		Svc:   make(chan func()),
+		Owner:   owner,
+		Channel: make(chan func()),
 	}
 	go func() {
 		for {
-			cmd, ok := <-s.Svc
+			cmd, ok := <-s.Channel
 			if !ok {
 				break
 			}
@@ -103,8 +105,8 @@ func (s *ChanSvc) Verify(i uint64) {
 
 // safely shutdown the service
 func (s *ChanSvc) Shutdown() {
-	Svc(s, false, func() {
-		close(s.Svc)
+	s.Svc(func() {
+		close(s.Channel)
 		s.Owner.ShutdownService(s)
 	})
 }
