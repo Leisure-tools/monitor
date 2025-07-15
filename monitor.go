@@ -134,6 +134,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"iter"
 	"net/http"
 	"net/url"
 	"os"
@@ -191,14 +192,15 @@ type monError struct {
 }
 
 type Monitoring struct {
-	redis      *redis.Client
-	Monitors   map[string]*RemoteMonitor // document id -> remote monitor
-	Service    *ChanSvc
-	Activity   string // current service activity
-	Verbose    int
-	Tracker    *fsnotify.Watcher
-	TrimPeriod int64
-	Tracking   u.Set[string]
+	redis               *redis.Client
+	Monitors            map[string]*RemoteMonitor // document id -> remote monitor
+	Service             *ChanSvc
+	Activity            string // current service activity
+	Verbose             int
+	Tracker             *fsnotify.Watcher
+	TrimPeriod          int64
+	Tracking            u.Set[string]
+	StreamUpdateChannel chan bool // received when the streams change
 }
 
 // a connection for a document
@@ -217,6 +219,7 @@ type RemoteMonitor struct {
 	DefaultTopic     string
 	AllTopics        u.Set[string]
 	TopicIDs         map[string]string
+	TopicMap         map[string]string
 	Serial           int64 // current update number for the connection
 	UpdateTimers     u.Set[*time.Timer]
 	Listeners        u.Set[MonitorListener]
@@ -323,8 +326,9 @@ func New(conStr string, verbose int, tlsconf *tls.Config) (*Monitoring, error) {
 					DB:        dbNum,
 					TLSConfig: tlsconf,
 				}),
-				Verbose: verbose,
-				Tracker: tracker,
+				Verbose:             verbose,
+				Tracker:             tracker,
+				StreamUpdateChannel: make(chan bool),
 			}
 			println("CONNECTED")
 			mon.Service = NewSvc(mon)
@@ -700,6 +704,7 @@ func (cnf *RedisConf) Read() (string, *tls.Config, error) {
 func (mon *Monitoring) WatchRedis(rate time.Duration) {
 	ctx := context.Background()
 	mct := mon.ctx()
+	first := true
 	go func() {
 		var streamsArg []string
 		count := 0
@@ -712,6 +717,9 @@ func (mon *Monitoring) WatchRedis(rate time.Duration) {
 				pos := 0
 				streamsArg = make([]string, topics*2)
 				for _, rm := range mon.Monitors {
+					if first {
+						mon.verbose("MONITOR OUTPUT %v", rm.DefaultTopic)
+					}
 					for topic := range rm.AllTopics {
 						streamsArg[pos] = topic
 						if id := rm.TopicIDs[topic]; id != "" {
@@ -729,11 +737,31 @@ func (mon *Monitoring) WatchRedis(rate time.Duration) {
 				time.Sleep(rate)
 				continue
 			}
+			if first {
+				first = false
+				mon.verbose("WATCHING TOPICS: %v", streamsArg)
+			}
 			cmd := mon.redis.XRead(ctx, &redis.XReadArgs{
 				Streams: streamsArg,
 				Block:   rate,
 			})
-			results, err := cmd.Result()
+			var err error
+			var results []redis.XStream
+			resultChan := make(chan bool)
+			go func() {
+				results, err = cmd.Result()
+				resultChan <- true
+			}()
+			select {
+			case <-resultChan:
+				if err != nil && err != redis.Nil {
+					panic(fmt.Sprintf("Couldn't read from REDIS: %#v", err))
+				}
+			case <-mon.StreamUpdateChannel:
+				// streams changed, do another update
+				first = true
+				continue
+			}
 			if err == redis.Nil {
 				count++
 				if count%100 == 0 {
@@ -789,6 +817,7 @@ func (mon *Monitoring) WatchRedis(rate time.Duration) {
 								rm.writeBlocks()
 							}
 						}
+						rm.computeTopics()
 						return true, nil
 					})
 				}
@@ -1023,6 +1052,7 @@ func (mon *Monitoring) Add(docId string) (*RemoteMonitor, error) {
 		ProcessingUpdate: atomic.Bool{},
 		DefaultTopic:     TOPIC_PREFIX + docId,
 		AllTopics:        u.Set[string]{TOPIC_PREFIX + docId: true},
+		TopicMap:         map[string]string{docId: TOPIC_PREFIX + docId},
 		TopicIDs:         make(map[string]string),
 		UpdateTimers:     make(u.Set[*time.Timer]),
 		Listeners:        make(u.Set[MonitorListener]),
@@ -1224,6 +1254,7 @@ func (rm *RemoteMonitor) BasicPatch(send, change bool, blocks ...map[string]any)
 			count++
 			fmt.Println("CHANGED:", block)
 			rm.StreamSerials[name] = rm.Serial
+			rm.verbose("@@@\n@@@ RECEIVED BLOCK %#v\n@@@", block)
 			rm.Blocks[name] = block
 			if change {
 				rm.Changed.Enqueue(block)
@@ -1233,18 +1264,41 @@ func (rm *RemoteMonitor) BasicPatch(send, change bool, blocks ...map[string]any)
 	}
 	if count > 0 {
 		rm.Serial++
-		rm.AllTopics = make(u.Set[string])
-		rm.AllTopics.Add(rm.DefaultTopic)
-		// a fingertree could maintain this automatically
-		for _, block := range rm.Blocks {
-			addTopics(rm.AllTopics, block)
-		}
+		rm.computeTopics()
 		if send {
 			fmt.Println("SENDING:", blocks[:count])
 			rm.Send(rm.Service.invocation, blocks[:count]...)
 		}
 	}
 	return nil
+}
+
+func (rm *RemoteMonitor) computeTopics() {
+	old := rm.AllTopics
+	rm.AllTopics = make(u.Set[string])
+	rm.addTopic(rm.DefaultTopic)
+	// a fingertree could maintain this automatically
+	for _, block := range rm.Blocks {
+		for topic := range propStrings(block["topics"]) {
+			rm.addTopic(topic)
+		}
+		for topic := range propStrings(block["updatetopics"]) {
+			rm.addTopic(topic)
+		}
+	}
+	if len(old) != len(rm.AllTopics) || !old.Contains(rm.AllTopics) {
+		// redo the current update if streams changed
+		go func() { rm.StreamUpdateChannel <- true }()
+	}
+}
+
+func (rm *RemoteMonitor) addTopic(topic string) {
+	realTopic := topic
+	if topic != rm.DefaultTopic {
+		realTopic = rm.DefaultTopic + "-" + topic
+	}
+	rm.TopicMap[topic] = realTopic
+	rm.AllTopics.Add(realTopic)
 }
 
 func (mon *Monitoring) httpDelete(w http.ResponseWriter, r *http.Request) {
@@ -1338,11 +1392,7 @@ func (rm *RemoteMonitor) basicDeleteBlocks(send bool, names ...string) ([]string
 	if deadCount < len(rm.Dead) {
 		rm.Serial++
 	}
-	topics, err := computeTopics(rm.Blocks)
-	if err != nil {
-		return nil, err
-	}
-	rm.AllTopics = topics
+	rm.computeTopics()
 	names = names[0:pos]
 	if len(names) == 0 {
 		return names, nil
@@ -1353,29 +1403,32 @@ func (rm *RemoteMonitor) basicDeleteBlocks(send bool, names ...string) ([]string
 	return names, nil
 }
 
-func computeTopics(blocks map[string]map[string]any) (u.Set[string], error) {
-	allTopics := make(u.Set[string])
-	for _, block := range blocks {
-		if err := addTopics(allTopics, block); err != nil {
-			return nil, err
-		}
-	}
-	return allTopics, nil
-}
-
-func addTopics(topics u.Set[string], blocks ...map[string]any) error {
-	for i, block := range blocks {
-		if blockTopics, ok := block["topics"].([]string); ok {
-			for _, topic := range blockTopics {
-				topics[topic] = true
+func propStrings(value any) iter.Seq[string] {
+	return func(yield func(item string) bool) {
+		if vstr, isString := value.(string); isString {
+			if vstr != "" {
+				yield(vstr)
 			}
-		} else if blockTopic, ok := block["topics"].(string); ok {
-			topics[blockTopic] = true
-		} else if block["topics"] != nil {
-			return fmt.Errorf("%w Block %d has a bad topic: %#v", ErrBadBlock, i, block)
+		} else if vstrs, isStrings := value.([]string); isStrings {
+			for _, str := range vstrs {
+				if str != "" {
+					if !yield(str) {
+						return
+					}
+				}
+			}
+		} else if varray, isArray := value.([]any); isArray {
+			for _, item := range varray {
+				if str, isString := item.(string); isString {
+					if vstr != "" {
+						if !yield(str) {
+							return
+						}
+					}
+				}
+			}
 		}
 	}
-	return nil
 }
 
 func (mon *Monitoring) httpUpdate(w http.ResponseWriter, r *http.Request) {
