@@ -134,7 +134,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"iter"
 	"net/http"
 	"net/url"
 	"os"
@@ -216,9 +215,9 @@ type RemoteMonitor struct {
 	IncomingUpdate   atomic.Int64
 	ProcessedUpdate  atomic.Int64
 	ProcessingUpdate atomic.Bool
-	DefaultTopic     string
-	AllTopics        u.Set[string]
-	TopicIDs         map[string]string
+	DefaultStream    string
+	AllStreams       u.Set[string]
+	StreamIDs        map[string]string
 	TopicMap         map[string]string
 	Serial           int64 // current update number for the connection
 	UpdateTimers     u.Set[*time.Timer]
@@ -364,10 +363,7 @@ func (mon *Monitoring) startTrimmer() {
 					}
 				}
 			}
-			period := ONE_MINUTE
-			if mon.TrimPeriod < ONE_MINUTE {
-				period = mon.TrimPeriod
-			}
+			period := min(mon.TrimPeriod, ONE_MINUTE)
 			time.Sleep(time.Duration(period))
 		}
 	}()
@@ -634,7 +630,7 @@ func ReadRedisConf(conf string) (int, int, string, *tls.Config, error) {
 	if f, err := os.ReadFile(conf); err != nil {
 		return 0, 0, "", nil, err
 	} else {
-		for _, line := range strings.Split(string(f), "\n") {
+		for line := range strings.SplitSeq(string(f), "\n") {
 			line = strings.TrimSpace(line)
 			if strings.HasPrefix(line, "requirepass") {
 				pass = strings.Split(line, " ")[1]
@@ -700,39 +696,23 @@ func (cnf *RedisConf) Read() (string, *tls.Config, error) {
 	return conStr, tls, err
 }
 
+type streamId struct {
+	stream string
+	id     string
+}
+
 // watch REDIS streams for changes
 func (mon *Monitoring) WatchRedis(rate time.Duration) {
-	ctx := context.Background()
-	mct := mon.ctx()
-	first := true
 	go func() {
-		var streamsArg []string
+		ctx := context.Background()
+		mct := mon.ctx()
+		first := true
+		streamsArg := make([]string, 0, 10)
 		count := 0
 		for {
-			CriticalSvcSync(mon.Service, func() (bool, error) {
-				topics := 0
-				for _, rm := range mon.Monitors {
-					topics += len(rm.AllTopics)
-				}
-				pos := 0
-				streamsArg = make([]string, topics*2)
-				for _, rm := range mon.Monitors {
-					if first {
-						mon.verbose("MONITOR OUTPUT %v", rm.DefaultTopic)
-					}
-					for topic := range rm.AllTopics {
-						streamsArg[pos] = topic
-						if id := rm.TopicIDs[topic]; id != "" {
-							streamsArg[pos+topics] = id
-						} else {
-							rm.TopicIDs[topic] = "0"
-							streamsArg[pos+topics] = "0"
-						}
-						pos++
-					}
-				}
-				return true, nil
-			})
+			monitors := mct.monitors()
+			streamsArg = mon.currentStreamsArg(monitors, streamsArg[:0])
+			mon.verboseN(2, "USING STREAMS %v", streamsArg)
 			if len(streamsArg) == 0 {
 				time.Sleep(rate)
 				continue
@@ -755,7 +735,7 @@ func (mon *Monitoring) WatchRedis(rate time.Duration) {
 			select {
 			case <-resultChan:
 				if err != nil && err != redis.Nil {
-					panic(fmt.Sprintf("Couldn't read from REDIS: %#v", err))
+					panic(fmt.Sprintf("Couldn't read from REDIS: %#v\n XREAD BLOCK %v STREAMS %#v", err, rate, streamsArg))
 				}
 			case <-mon.StreamUpdateChannel:
 				// streams changed, do another update
@@ -771,60 +751,87 @@ func (mon *Monitoring) WatchRedis(rate time.Duration) {
 			} else if err != nil {
 				panic(fmt.Sprintf("Couldn't read from REDIS: %#v", err))
 			}
-			mon.verbose("Got stream results from REDIS: %#v", results)
-			monitors := mct.monitors()
-			chosen := u.NewSet[string]()
-			// index monitors by stream ID
-			for _, str := range results {
-				for _, rm := range monitors {
-					WrappedSvcSync(rm.Service, func() (bool, error) {
-						startSer := rm.Serial
-						if rm.AllTopics.Has(str.Stream) {
-							chosen.Add(str.Stream)
-							rm.TopicIDs[str.Stream] = str.Messages[len(str.Messages)-1].ID
-							for _, msg := range str.Messages {
-								var obj any
-								if msg.Values["sender"] == rm.PeerId {
-									continue
-								} else if snd, isString := msg.Values["sender"]; isString {
-									mon.verbose("RECEIVED MESSAGE\n  FROM %s\n  THIS: %s", snd, rm.PeerId)
-								}
-								str := msg.Values["batch"]
-								if err := json.Unmarshal([]byte(str.(string)), &obj); err != nil {
-									abort("Could not parse JSON for message %#v", str)
-								} else if m, ok := obj.([]any); !ok {
-									abort("batch is not an array: %#v", obj)
-								} else {
-									for _, block := range m {
-										if dict, ok := block.(map[string]any); !ok {
-											abort("batch item is not a map[string]any: %#v", obj)
-										} else if err := rm.HandleBlock(dict); err != nil {
-											abort("%w", err)
-										}
-									}
-								}
-							}
-						}
-						if !rm.Changed.IsEmpty() {
-							rm.notifyChanged()
-						}
-						// check if any incoming blocks were stored
-						if startSer < rm.Serial {
-							for timer := range rm.UpdateTimers {
-								timer.Reset(time.Microsecond)
-							}
-							if rm.Track != "" {
-								rm.writeBlocks()
-							}
-						}
-						rm.computeTopics()
-						return true, nil
-					})
-				}
-			}
-			fmt.Printf("Streams processed: %s\n", strings.Join(chosen.ToSlice(), ", "))
+			mon.dispatchStreamResults(monitors, results)
 		}
 	}()
+}
+
+func (mon *Monitoring) currentStreamsArg(monitors []*RemoteMonitor, streamsArg []string) []string {
+	mon.verboseN(3, "getting streams for %d monitors", len(monitors))
+	eachTop := Collect(u.SliceSeq(monitors), func(rm *RemoteMonitor, yield func(s streamId) bool) {
+		for stream := range rm.AllStreams {
+			mon.verboseN(3, "FOUND STREAM %s", stream)
+			if rm.StreamIDs[stream] == "" {
+				rm.StreamIDs[stream] = "0"
+			}
+			if !yield(streamId{stream, rm.StreamIDs[stream]}) {
+				break
+			}
+		}
+	})
+	ids := make([]string, 0, len(monitors)*2)
+	strs := u.NewSet[string]()
+	for sid := range eachTop {
+		if !strs.Has(sid.stream) {
+			strs.Add(sid.stream)
+			streamsArg = append(streamsArg, sid.stream)
+			ids = append(ids, sid.id)
+		}
+	}
+	streamsArg = append(streamsArg, ids...)
+	return streamsArg
+}
+
+func (mon *Monitoring) dispatchStreamResults(monitors []*RemoteMonitor, results []redis.XStream) {
+	mon.verbose("Got stream results from REDIS: %#v", results)
+	chosen := u.NewSet[string]()
+	// index monitors by stream ID
+	for _, str := range results {
+		for _, rm := range monitors {
+			rm.Svc(func() {
+				startSer := rm.Serial
+				if rm.AllStreams.Has(str.Stream) {
+					chosen.Add(str.Stream)
+					rm.StreamIDs[str.Stream] = str.Messages[len(str.Messages)-1].ID
+					for _, msg := range str.Messages {
+						var obj any
+						if msg.Values["sender"] == rm.PeerId {
+							continue
+						} else if snd, isString := msg.Values["sender"]; isString {
+							mon.verbose("RECEIVED MESSAGE\n  FROM %s\n  THIS: %s", snd, rm.PeerId)
+						}
+						str := msg.Values["batch"]
+						if err := json.Unmarshal([]byte(str.(string)), &obj); err != nil {
+							abort("Could not parse JSON for message %#v", str)
+						} else if m, ok := obj.([]any); !ok {
+							abort("batch is not an array: %#v", obj)
+						} else {
+							for _, block := range m {
+								if dict, ok := block.(map[string]any); !ok {
+									abort("batch item is not a map[string]any: %#v", obj)
+								} else if err := rm.HandleBlock(dict); err != nil {
+									abort("%w", err)
+								}
+							}
+						}
+					}
+				}
+				if !rm.Changed.IsEmpty() {
+					rm.notifyChanged()
+				}
+				// check if any incoming blocks were stored
+				if startSer < rm.Serial {
+					for timer := range rm.UpdateTimers {
+						timer.Reset(time.Microsecond)
+					}
+					if rm.Track != "" {
+						rm.writeBlocks()
+					}
+				}
+				rm.ComputeTopics()
+			})
+		}
+	}
 }
 
 func (mon *Monitoring) Shutdown() { mon.Service.Shutdown() }
@@ -1050,10 +1057,10 @@ func (mon *Monitoring) Add(docId string) (*RemoteMonitor, error) {
 		IncomingUpdate:   atomic.Int64{},
 		ProcessedUpdate:  atomic.Int64{},
 		ProcessingUpdate: atomic.Bool{},
-		DefaultTopic:     TOPIC_PREFIX + docId,
-		AllTopics:        u.Set[string]{TOPIC_PREFIX + docId: true},
+		DefaultStream:    TOPIC_PREFIX + docId,
+		AllStreams:       u.NewSet(TOPIC_PREFIX + docId),
 		TopicMap:         map[string]string{docId: TOPIC_PREFIX + docId},
-		TopicIDs:         make(map[string]string),
+		StreamIDs:        make(map[string]string),
 		UpdateTimers:     make(u.Set[*time.Timer]),
 		Listeners:        make(u.Set[MonitorListener]),
 		Changed:          &u.ConcurrentQueue[map[string]any]{},
@@ -1097,7 +1104,7 @@ func (rm *RemoteMonitor) ShutdownService(c *ChanSvc) {
 		rm.Blocks = nil
 		rm.StreamSerials = nil
 		rm.Dead = nil
-		rm.AllTopics = nil
+		rm.AllStreams = u.Set[string]{}
 		rm.Monitoring = nil
 	})
 }
@@ -1264,7 +1271,7 @@ func (rm *RemoteMonitor) BasicPatch(send, change bool, blocks ...map[string]any)
 	}
 	if count > 0 {
 		rm.Serial++
-		rm.computeTopics()
+		rm.ComputeTopics()
 		if send {
 			fmt.Println("SENDING:", blocks[:count])
 			rm.Send(rm.Service.invocation, blocks[:count]...)
@@ -1273,32 +1280,33 @@ func (rm *RemoteMonitor) BasicPatch(send, change bool, blocks ...map[string]any)
 	return nil
 }
 
-func (rm *RemoteMonitor) computeTopics() {
-	old := rm.AllTopics
-	rm.AllTopics = make(u.Set[string])
-	rm.addTopic(rm.DefaultTopic)
+func (rm *RemoteMonitor) ComputeTopics() {
+	old := rm.AllStreams
+	rm.AllStreams = make(u.Set[string])
+	rm.addTopic(rm.DefaultStream)
 	// a fingertree could maintain this automatically
 	for _, block := range rm.Blocks {
-		for topic := range propStrings(block["topics"]) {
+		for topic := range u.PropStrings(block["topics"]) {
 			rm.addTopic(topic)
 		}
-		for topic := range propStrings(block["updatetopics"]) {
+		for topic := range u.PropStrings(block["updatetopics"]) {
 			rm.addTopic(topic)
 		}
 	}
-	if len(old) != len(rm.AllTopics) || !old.Contains(rm.AllTopics) {
+	if len(rm.AllStreams) != len(old) || !rm.AllStreams.Contains(old) {
+		rm.verbose("CHANGING WATCHED TOPICS: %v", rm.AllStreams)
 		// redo the current update if streams changed
 		go func() { rm.StreamUpdateChannel <- true }()
 	}
 }
 
 func (rm *RemoteMonitor) addTopic(topic string) {
-	realTopic := topic
-	if topic != rm.DefaultTopic {
-		realTopic = rm.DefaultTopic + "-" + topic
+	stream := topic
+	if topic != rm.DefaultStream {
+		stream = rm.DefaultStream + "-" + topic
 	}
-	rm.TopicMap[topic] = realTopic
-	rm.AllTopics.Add(realTopic)
+	rm.TopicMap[topic] = stream
+	rm.AllStreams.Add(stream)
 }
 
 func (mon *Monitoring) httpDelete(w http.ResponseWriter, r *http.Request) {
@@ -1392,7 +1400,7 @@ func (rm *RemoteMonitor) basicDeleteBlocks(send bool, names ...string) ([]string
 	if deadCount < len(rm.Dead) {
 		rm.Serial++
 	}
-	rm.computeTopics()
+	rm.ComputeTopics()
 	names = names[0:pos]
 	if len(names) == 0 {
 		return names, nil
@@ -1401,34 +1409,6 @@ func (rm *RemoteMonitor) basicDeleteBlocks(send bool, names ...string) ([]string
 		rm.Send(i, JMap("type", "delete", "value", names))
 	}
 	return names, nil
-}
-
-func propStrings(value any) iter.Seq[string] {
-	return func(yield func(item string) bool) {
-		if vstr, isString := value.(string); isString {
-			if vstr != "" {
-				yield(vstr)
-			}
-		} else if vstrs, isStrings := value.([]string); isStrings {
-			for _, str := range vstrs {
-				if str != "" {
-					if !yield(str) {
-						return
-					}
-				}
-			}
-		} else if varray, isArray := value.([]any); isArray {
-			for _, item := range varray {
-				if str, isString := item.(string); isString {
-					if vstr != "" {
-						if !yield(str) {
-							return
-						}
-					}
-				}
-			}
-		}
-	}
 }
 
 func (mon *Monitoring) httpUpdate(w http.ResponseWriter, r *http.Request) {
@@ -1457,7 +1437,7 @@ func (mon *Monitoring) httpUpdate(w http.ResponseWriter, r *http.Request) {
 	rmSerial, result, deleted := rm.GetUpdates(serial, timeout, nodata)
 	w.WriteHeader(http.StatusOK)
 	if nodata {
-		w.Write([]byte(fmt.Sprint(rmSerial)))
+		fmt.Fprint(w, rmSerial)
 	} else if result != nil {
 		activity = "encoding update blocks"
 		encoded, err := json.Marshal(JMap("serial", rmSerial, "blocks", result, "deleted", deleted))
@@ -1509,7 +1489,7 @@ func (rm *RemoteMonitor) trackFile(filename string) error {
 	} else if absfilename, err := filepath.Abs(symfilename); err != nil {
 		return err
 	} else if rm.Track != "" {
-		return fmt.Errorf(fmt.Sprintf("Already tracking %s", rm.Track))
+		return fmt.Errorf("Already tracking %s", rm.Track)
 	} else if err := rm.Monitoring.addFile(absfilename); err != nil {
 		return err
 	} else {
@@ -1593,8 +1573,8 @@ func (rm *RemoteMonitor) Send(i uint64, blocks ...map[string]any) {
 	if len(blocks) == 0 {
 		return
 	}
-	defaultTopics := []string{rm.DefaultTopic}
-	topics := defaultTopics
+	defaultTopics := []string{rm.DefaultStream}
+	topics := []string{rm.DefaultStream}
 	start := 0
 	ctx := context.Background()
 	sendOnTopic := func(topic string, blocks any) {
@@ -1626,14 +1606,20 @@ func (rm *RemoteMonitor) Send(i uint64, blocks ...map[string]any) {
 		t := u.EnsliceStrings(block["topics"])
 		if len(t) == 0 || (len(t) == 1 && t[0] == "") {
 			t = defaultTopics
+		} else {
+			if _, isStrings := block["topics"].([]string); isStrings {
+				newT := make([]string, 0, len(t))
+				copy(newT, t)
+				t = newT
+			}
+			for i, topic := range t {
+				t[i] = rm.DefaultStream + "-" + topic
+			}
 		}
 		rm.verbose("SENDING ON TOPICS: %#v", t)
 		if !rm.sameTopics(t, topics) {
 			sendBlocks(i)
 			topics = t
-			if topics == nil {
-				topics = []string{rm.DefaultTopic}
-			}
 		}
 	}
 	sendBlocks(len(blocks))
@@ -1641,9 +1627,9 @@ func (rm *RemoteMonitor) Send(i uint64, blocks ...map[string]any) {
 
 func (rm *RemoteMonitor) sameTopics(a, b []string) bool {
 	if a == nil {
-		return b == nil || (len(b) == 1 && b[0] == rm.DefaultTopic)
+		return b == nil || (len(b) == 1 && b[0] == rm.DefaultStream)
 	} else if b == nil {
-		return len(a) == 1 && a[0] == rm.DefaultTopic
+		return len(a) == 1 && a[0] == rm.DefaultStream
 	} else if len(a) != len(b) {
 		return false
 	}

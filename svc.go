@@ -1,7 +1,9 @@
 package monitor
 
 import (
+	"errors"
 	"fmt"
+	"iter"
 	"sync/atomic"
 )
 
@@ -21,6 +23,77 @@ type ServiceOwner interface {
 
 type SvcRunner interface {
 	Svc(code func(), wrap ...bool)
+}
+
+func Collect[T SvcRunner, Result any](runners iter.Seq[T], code func(T, func(Result) bool)) iter.Seq[Result] {
+	results := make(chan Result)
+	counts := make(chan int)
+	errorChan := make(chan error)
+	count := 0
+	expected := 0
+	for runner := range runners {
+		count++
+		runner.Svc(func() {
+			count := 0
+			defer func() {
+				// recover from writing to a dead counts or error chan
+				defer func() { recover() }()
+				if err := recover(); err != nil {
+					e, ok := err.(error)
+					if !ok {
+						e = fmt.Errorf("Error in service: %v", e)
+					}
+					errorChan <- e
+				}
+				counts <- count
+			}()
+			live := true
+			code(runner, func(item Result) bool {
+				if live {
+					func() {
+						defer func() {
+							if err := recover(); err != nil {
+								live = false
+							}
+						}()
+						results <- item
+						count++
+					}()
+				}
+				return live
+			})
+		})
+	}
+	return func(yield func(item Result) bool) {
+		//processed := 0
+	loop:
+		for count > 0 || expected > 0 {
+			select {
+			case c := <-counts:
+				expected += c
+				count--
+			case r := <-results:
+				//processed++
+				expected--
+				if !yield(r) {
+					break loop
+				}
+			}
+		}
+		//if processed > 0 {
+		//	fmt.Printf("PROCESSED %d ITEMS\n", processed)
+		//}
+		close(errorChan)
+		close(results)
+		close(counts)
+		errs := make([]error, 0, count)
+		for err := range errorChan {
+			errs = append(errs, err)
+		}
+		if len(errs) > 0 {
+			panic(fmt.Errorf("Service errors: %w", errors.Join(errs...)))
+		}
+	}
 }
 
 func (s *ChanSvc) String() string {
