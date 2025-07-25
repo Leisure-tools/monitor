@@ -815,6 +815,8 @@ func (mon *Monitoring) dispatchStreamResults(monitors []*RemoteMonitor, results 
 							}
 						}
 					}
+				} else {
+					mon.verbose("IGNORING STREAM %s", str.Stream)
 				}
 				if !rm.Changed.IsEmpty() {
 					rm.notifyChanged()
@@ -1282,6 +1284,7 @@ func (rm *RemoteMonitor) BasicPatch(send, change bool, blocks ...map[string]any)
 
 func (rm *RemoteMonitor) ComputeTopics() {
 	old := rm.AllStreams
+	rm.TopicMap = make(map[string]string)
 	rm.AllStreams = make(u.Set[string])
 	rm.addTopic(rm.DefaultStream)
 	// a fingertree could maintain this automatically
